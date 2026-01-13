@@ -1,6 +1,7 @@
 package kvsrv
 
 import (
+	// "fmt"
 	"log"
 	"sync"
 
@@ -34,6 +35,7 @@ func MakeKVServer() *KVServer {
 	kv := &KVServer{
 		KVStore: make(map[string]ValueTuple),
 	}
+	kv.KVStore["l"] = ValueTuple{value: "", version: 1}
 	return kv
 }
 
