@@ -265,28 +265,36 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 
 	rf.lastPingTime = time.Now()
 	rf.leaderId = args.LeaderId
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
-		rf.applyCond.Broadcast()
-	}
 	if args.Term > rf.currentTerm {
 		rf.stepDownToFollower(args.Term)
 	}
 
-	// HeartBeatMessages
 	reply.Term = rf.currentTerm
+
 	if rf.getLastLogIndex() < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 		return
-	} else if args.Entries == nil {
-		reply.Success = true
-		return
-	} else {
-		insertionIndex := args.PrevLogIndex + 1
-		rf.log = rf.log[:insertionIndex]
-		rf.log = append(rf.log, args.Entries...)
-		reply.Success = true
 	}
+
+	if len(args.Entries) > 0 {
+		for i, entry := range args.Entries {
+			logIndex := args.PrevLogIndex + 1 + i
+			if logIndex <= rf.getLastLogIndex() {
+				if rf.log[logIndex].Term != entry.Term {
+					// Conflict found - truncate from here and append rest
+					rf.log = rf.log[:logIndex]
+					rf.log = append(rf.log, args.Entries[i:]...)
+					break
+				}
+			} else {
+				rf.log = append(rf.log, args.Entries[i:]...)
+				break
+			}
+		}
+	}
+
+	reply.Success = true
+
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
 		rf.applyCond.Broadcast()
@@ -420,20 +428,20 @@ func (rf *Raft) sendNewEntriesToPeer(i int) {
 	rf.mu.Unlock()
 
 	ok := rf.sendAppendEntry(i, args, reply)
-	if !ok {
-		go rf.sendNewEntriesToPeer(i)
-		return
-	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.status != 2 || rf.currentTerm != args.Term {
 		return
 	}
+	if !ok {
+		go rf.sendNewEntriesToPeer(i)
+		return
+	}
 	if reply.Term > rf.currentTerm {
 		rf.stepDownToFollower(reply.Term)
 	} else if reply.Success {
-		rf.nextIndex[i] = endOfEntries + 1
-		rf.matchIndex[i] = endOfEntries
+		rf.nextIndex[i] = max(rf.nextIndex[i], endOfEntries+1)
+		rf.matchIndex[i] = max(rf.matchIndex[i], endOfEntries)
 	} else if !reply.Success {
 		rf.nextIndex[i] = max(1, rf.nextIndex[i]-1)
 		go rf.sendNewEntriesToPeer(i)
