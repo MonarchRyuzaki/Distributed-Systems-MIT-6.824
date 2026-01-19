@@ -66,6 +66,12 @@ func (l *Log) getTerm() int {
 	return l.Term
 }
 
+func (rf *Raft) stepDownToFollower(term int) {
+	rf.currentTerm = term
+	rf.votedFor = -1
+	rf.status = 0
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -179,12 +185,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
-		rf.status = 0
+		rf.stepDownToFollower(args.Term)
 	}
-	
-	reply.Term = rf.currentTerm 
+
+	reply.Term = rf.currentTerm
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && rf.isCandidateLogUpToDate(args.LastLogTerm, args.LastLogIndex) {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
@@ -253,9 +257,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.leaderId = args.LeaderId
 	rf.commitIndex = args.LeaderCommit
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
-		rf.status = 0
+		rf.stepDownToFollower(args.Term)
 	}
 
 	// HeartBeatMessages
@@ -298,9 +300,7 @@ func (rf *Raft) sendHeartbeats() {
 				if ok {
 					rf.mu.Lock()
 					if reply.Term > rf.currentTerm {
-						rf.currentTerm = reply.Term
-						rf.votedFor = -1
-						rf.status = 0
+						rf.stepDownToFollower(reply.Term)
 					}
 					rf.mu.Unlock()
 				}
@@ -379,17 +379,15 @@ func (rf *Raft) startElection() {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
 				if rf.currentTerm != term || rf.status != 1 {
-					return 
+					return
 				}
 				if reply.Term > term {
-					rf.currentTerm = reply.Term
-					rf.votedFor = -1
-					rf.status = 0
+					rf.stepDownToFollower(reply.Term)
 					return
 				}
 				if reply.VoteGranted {
 					votes++
-					if votes > rf.numberOfPeers / 2 {
+					if votes > rf.numberOfPeers/2 {
 						DPrintf("Peer %v has votes making it leader. Starting to send HeartBeatMessages", rf.me)
 						rf.status = 2
 						rf.cond.Broadcast()
@@ -414,7 +412,7 @@ func (rf *Raft) ticker() {
 
 		rf.mu.Lock()
 		if time.Since(rf.lastPingTime) > timeout {
-			DPrintf("Peer %v. Election timeout triggered.", rf.me);
+			DPrintf("Peer %v. Election timeout triggered.", rf.me)
 			go rf.startElection()
 		}
 		rf.mu.Unlock()
