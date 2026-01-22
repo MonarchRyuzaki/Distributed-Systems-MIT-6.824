@@ -8,6 +8,7 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sort"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -72,6 +74,7 @@ func (rf *Raft) stepDownToFollower(term int) {
 	rf.currentTerm = term
 	rf.votedFor = -1
 	rf.status = 0
+	go rf.persist()
 }
 
 func (rf *Raft) getLastLogIndex() int {
@@ -111,6 +114,15 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -131,6 +143,19 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm, votedFor int
+	var log []Log
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		DPrintf("Error Decoding State for Peer %v\n", rf.me)
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // how many bytes in Raft's persisted log?
@@ -206,6 +231,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		reply.VoteGranted = false
 	}
+	go rf.persist()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -299,6 +325,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		rf.commitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
 		rf.applyCond.Broadcast()
 	}
+	go rf.persist()
 }
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
@@ -332,6 +359,7 @@ func (rf *Raft) sendHeartbeats() {
 		rf.lastPingTime = time.Now()
 		rf.leaderId = rf.me
 		rf.mu.Unlock()
+		go rf.persist()
 		for i := 0; i < rf.numberOfPeers; i++ {
 			if i == rf.me {
 				continue
@@ -346,8 +374,10 @@ func (rf *Raft) sendHeartbeats() {
 					}
 					rf.mu.Unlock()
 				}
+				go rf.persist()
 			}(i, args)
 		}
+		go rf.persist()
 		time.Sleep(50 * time.Millisecond)
 	}
 }
@@ -387,6 +417,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	DPrintf("Peer %v, Received New Log Entry Starting Agreement", rf.me)
 
 	go rf.startAgreement()
+	go rf.persist()
 
 	return index, rf.currentTerm, true
 }
@@ -446,7 +477,7 @@ func (rf *Raft) sendNewEntriesToPeer(i int) {
 		rf.nextIndex[i] = max(1, rf.nextIndex[i]-1)
 		go rf.sendNewEntriesToPeer(i)
 	}
-
+	go rf.persist()
 }
 
 func (rf *Raft) leaderUpdateCommitIndex() {
@@ -531,6 +562,7 @@ func (rf *Raft) startElection() {
 		LastLogIndex: rf.log[len(rf.log)-1].getIndex(),
 		LastLogTerm:  rf.log[len(rf.log)-1].getTerm(),
 	}
+	go rf.persist()
 	rf.mu.Unlock()
 
 	var votesMu sync.Mutex
@@ -551,6 +583,7 @@ func (rf *Raft) startElection() {
 				}
 				if reply.Term > term {
 					rf.stepDownToFollower(reply.Term)
+					go rf.persist()
 					return
 				}
 				if reply.VoteGranted {
@@ -564,8 +597,10 @@ func (rf *Raft) startElection() {
 					}
 					votesMu.Unlock()
 				}
+				go rf.persist()
 			}
 		}(i, args)
+		go rf.persist()
 	}
 
 }
