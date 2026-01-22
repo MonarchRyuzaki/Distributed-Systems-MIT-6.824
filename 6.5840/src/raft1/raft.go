@@ -278,6 +278,9 @@ type AppendEntryArgs struct {
 type AppendEntryReply struct {
 	Term    int
 	Success bool
+	XTerm   int
+	XIndex  int
+	XLen    int
 }
 
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
@@ -297,8 +300,25 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 
 	reply.Term = rf.currentTerm
 
-	if rf.getLastLogIndex() < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if rf.getLastLogIndex() < args.PrevLogIndex {
 		reply.Success = false
+		reply.XTerm = -1
+		reply.XIndex = -1
+		reply.XLen = len(rf.log)
+		return
+	}
+
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.XTerm = rf.log[args.PrevLogIndex].Term
+		reply.XIndex = args.PrevLogIndex
+        for j := args.PrevLogIndex - 1; j >= 0; j-- {
+            if rf.log[j].Term != reply.XTerm {
+                break
+            }
+            reply.XIndex = j
+        }
+		reply.XLen = -1
 		return
 	}
 
@@ -474,7 +494,26 @@ func (rf *Raft) sendNewEntriesToPeer(i int) {
 		rf.nextIndex[i] = max(rf.nextIndex[i], endOfEntries+1)
 		rf.matchIndex[i] = max(rf.matchIndex[i], endOfEntries)
 	} else if !reply.Success {
-		rf.nextIndex[i] = max(1, rf.nextIndex[i]-1)
+		if reply.XLen != -1 {
+			rf.nextIndex[i] = max(1, reply.XLen)
+		} else {
+			found := false
+            lastIndex := -1
+            for j := len(rf.log) - 1; j >= 1; j-- {
+                if rf.log[j].Term == reply.XTerm {
+                    lastIndex = j
+                    found = true
+                    break
+                } else if rf.log[j].Term < reply.XTerm {
+                    break
+                }
+            }
+            if found {
+                rf.nextIndex[i] = max(1, lastIndex+1)
+            } else {
+                rf.nextIndex[i] = max(1, reply.XIndex)
+            }
+		}
 		go rf.sendNewEntriesToPeer(i)
 	}
 	go rf.persist()
