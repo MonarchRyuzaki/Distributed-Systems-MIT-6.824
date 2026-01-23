@@ -399,6 +399,75 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *Append
 	return ok
 }
 
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	rf.lastPingTime = time.Now()
+	rf.leaderId = args.LeaderId
+	if args.Term > rf.currentTerm {
+		rf.stepDownToFollower(args.Term)
+	}
+
+	reply.Term = rf.currentTerm
+
+	if args.LastIncludedIndex <= rf.log[0].Index {
+		return
+	}
+
+	if args.LastIncludedIndex < rf.getLastLogIndex() {
+		arrayIndex := rf.getPhysicalArrayIndex(args.LastIncludedIndex)
+		if rf.log[arrayIndex].Term == args.LastIncludedTerm {
+			rf.log = rf.log[rf.getPhysicalArrayIndex(args.LastIncludedIndex):]
+		} else {
+			rf.log = []Log{{Index: args.LastIncludedIndex, Term: args.LastIncludedTerm}}
+		}
+	} else {
+		rf.log = []Log{{Index: args.LastIncludedIndex, Term: args.LastIncludedTerm}}
+	}
+
+	rf.log[0].Command = nil
+
+	rf.lastApplied = args.LastIncludedIndex
+	rf.commitIndex = args.LastIncludedIndex
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	rf.persister.Save(w.Bytes(), args.Data)
+
+	// Tell service to restore from snapshot (outside lock to avoid deadlock)
+	rf.applyCh <- raftapi.ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotTerm:  args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
+	}
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
 func (rf *Raft) reinitializeStateForLeader() {
 	for i := 0; i < rf.numberOfPeers; i++ {
 		rf.nextIndex[i] = rf.getLastLogIndex() + 1
@@ -513,8 +582,29 @@ func (rf *Raft) sendNewEntriesToPeer(i int) {
 	endOfEntries := rf.getLastLogIndex()
 
 	if startOfEntries <= baseIndex {
-		// TODO: Send Install Snapshot RPC
+		args := &InstallSnapshotArgs{
+			Term:              rf.currentTerm,
+			LeaderId:          rf.me,
+			LastIncludedIndex: rf.log[0].Index,
+			LastIncludedTerm:  rf.log[0].Term,
+			Data:              rf.persister.ReadSnapshot(),
+		}
 		rf.mu.Unlock()
+		reply := &InstallSnapshotReply{}
+
+		ok := rf.sendInstallSnapshot(i, args, reply)
+
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if !ok || rf.status != 2 || rf.currentTerm != args.Term {
+			return
+		}
+		if reply.Term > rf.currentTerm {
+			rf.stepDownToFollower(reply.Term)
+			return
+		}
+		rf.nextIndex[i] = args.LastIncludedIndex + 1
+		rf.matchIndex[i] = args.LastIncludedIndex
 		return
 	}
 	if startOfEntries > endOfEntries {
@@ -526,7 +616,7 @@ func (rf *Raft) sendNewEntriesToPeer(i int) {
 		LeaderId:     rf.leaderId,
 		PrevLogIndex: startOfEntries - 1,
 		PrevLogTerm:  rf.log[rf.getPhysicalArrayIndex(startOfEntries-1)].Term,
-		Entries:      rf.log[rf.getPhysicalArrayIndex(startOfEntries) : rf.getPhysicalArrayIndex(endOfEntries+1)],
+		Entries:      rf.log[rf.getPhysicalArrayIndex(startOfEntries):rf.getPhysicalArrayIndex(endOfEntries+1)],
 		LeaderCommit: rf.commitIndex,
 	}
 	reply := &AppendEntryReply{}
@@ -564,9 +654,9 @@ func (rf *Raft) sendNewEntriesToPeer(i int) {
 				}
 			}
 			if found {
-				rf.nextIndex[i] = max(baseIndex + 1, lastIndex+1)
+				rf.nextIndex[i] = max(baseIndex+1, lastIndex+1)
 			} else {
-				rf.nextIndex[i] = max(baseIndex + 1, reply.XIndex)
+				rf.nextIndex[i] = max(baseIndex+1, reply.XIndex)
 			}
 		}
 		go rf.sendNewEntriesToPeer(i)
@@ -611,7 +701,7 @@ func (rf *Raft) applyToStateMachine() {
 		msgs := make([]raftapi.ApplyMsg, 0)
 		for rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
-			arrayIndex := rf.getPhysicalArrayIndex(rf.lastApplied);
+			arrayIndex := rf.getPhysicalArrayIndex(rf.lastApplied)
 			msgs = append(msgs, raftapi.ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log[arrayIndex].Command,
@@ -770,8 +860,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		go func() {
 			rf.applyCh <- raftapi.ApplyMsg{
 				SnapshotValid: true,
-				Snapshot: snapshot,
-				SnapshotTerm: rf.log[0].Term,
+				Snapshot:      snapshot,
+				SnapshotTerm:  rf.log[0].Term,
 				SnapshotIndex: rf.log[0].Index,
 			}
 		}()
