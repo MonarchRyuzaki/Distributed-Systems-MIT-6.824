@@ -45,6 +45,16 @@ for i in $(seq 1 $runs); do
         echo "3C: FAILED"
         ((failed++))
     fi
+    sleep 2
+
+    echo ""
+    echo "--- Test 3D ---"
+    if go test -run 3D; then
+        echo "3D: PASSED"
+    else
+        echo "3D: FAILED"
+        ((failed++))
+    fi
     
     if [ $i -lt $runs ]; then
         echo ""

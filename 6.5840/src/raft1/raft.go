@@ -85,6 +85,14 @@ func (rf *Raft) getLastLogTerm() int {
 	return rf.log[len(rf.log)-1].getTerm()
 }
 
+func (rf *Raft) getLogicalArrayIndex(i int) int {
+	return i + rf.log[0].Index
+}
+
+func (rf *Raft) getPhysicalArrayIndex(i int) int {
+	return i - rf.log[0].Index
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -122,7 +130,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	rf.persister.Save(raftstate, rf.persister.ReadSnapshot())
 }
 
 // restore previously persisted state.
@@ -155,6 +163,8 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
+		rf.lastApplied = rf.log[0].Index
+		rf.commitIndex = rf.log[0].Index
 	}
 }
 
@@ -171,6 +181,29 @@ func (rf *Raft) PersistBytes() int {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// Using rf.log[0] as the snapshot metadata state
+	if index <= rf.log[0].Index || index > rf.commitIndex {
+		return
+	}
+
+	snapshotTerm := rf.log[rf.getPhysicalArrayIndex(index)].Term
+
+	rf.log = rf.log[rf.getPhysicalArrayIndex(index):]
+	rf.log[0].Command = nil
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, snapshot)
+
+	DPrintf("Peer %v: Snapshot taken at index %v, term %v", rf.me, index, snapshotTerm)
 
 }
 
@@ -300,24 +333,37 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 
 	reply.Term = rf.currentTerm
 
+	baseIndex := rf.log[0].Index
+
+	if args.PrevLogIndex < baseIndex {
+		overlap := baseIndex - args.PrevLogIndex
+		if overlap >= len(args.Entries) {
+			reply.Success = true
+			return
+		}
+		args.Entries = args.Entries[overlap:]
+		args.PrevLogIndex = baseIndex
+		args.PrevLogTerm = rf.log[0].Term
+	}
+
 	if rf.getLastLogIndex() < args.PrevLogIndex {
 		reply.Success = false
 		reply.XTerm = -1
 		reply.XIndex = -1
-		reply.XLen = len(rf.log)
+		reply.XLen = rf.getLastLogIndex() + 1
 		return
 	}
 
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if rf.log[rf.getPhysicalArrayIndex(args.PrevLogIndex)].Term != args.PrevLogTerm {
 		reply.Success = false
-		reply.XTerm = rf.log[args.PrevLogIndex].Term
+		reply.XTerm = rf.log[rf.getPhysicalArrayIndex(args.PrevLogIndex)].Term
 		reply.XIndex = args.PrevLogIndex
-        for j := args.PrevLogIndex - 1; j >= 0; j-- {
-            if rf.log[j].Term != reply.XTerm {
-                break
-            }
-            reply.XIndex = j
-        }
+		for j := rf.getPhysicalArrayIndex(args.PrevLogIndex) - 1; j >= 0; j-- {
+			if rf.log[j].Term != reply.XTerm {
+				break
+			}
+			reply.XIndex = rf.getLogicalArrayIndex(j)
+		}
 		reply.XLen = -1
 		return
 	}
@@ -326,9 +372,9 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		for i, entry := range args.Entries {
 			logIndex := args.PrevLogIndex + 1 + i
 			if logIndex <= rf.getLastLogIndex() {
-				if rf.log[logIndex].Term != entry.Term {
+				if rf.log[rf.getPhysicalArrayIndex(logIndex)].Term != entry.Term {
 					// Conflict found - truncate from here and append rest
-					rf.log = rf.log[:logIndex]
+					rf.log = rf.log[:rf.getPhysicalArrayIndex(logIndex)]
 					rf.log = append(rf.log, args.Entries[i:]...)
 					break
 				}
@@ -356,7 +402,7 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *Append
 func (rf *Raft) reinitializeStateForLeader() {
 	for i := 0; i < rf.numberOfPeers; i++ {
 		rf.nextIndex[i] = rf.getLastLogIndex() + 1
-		rf.matchIndex[i] = 0
+		rf.matchIndex[i] = rf.log[0].Index
 	}
 	rf.matchIndex[rf.me] = rf.getLastLogIndex()
 }
@@ -461,8 +507,16 @@ func (rf *Raft) sendNewEntriesToPeer(i int) {
 		rf.mu.Unlock()
 		return
 	}
+
+	baseIndex := rf.log[0].Index
 	startOfEntries := rf.nextIndex[i]
 	endOfEntries := rf.getLastLogIndex()
+
+	if startOfEntries <= baseIndex {
+		// TODO: Send Install Snapshot RPC
+		rf.mu.Unlock()
+		return
+	}
 	if startOfEntries > endOfEntries {
 		rf.mu.Unlock()
 		return
@@ -471,8 +525,8 @@ func (rf *Raft) sendNewEntriesToPeer(i int) {
 		Term:         rf.currentTerm,
 		LeaderId:     rf.leaderId,
 		PrevLogIndex: startOfEntries - 1,
-		PrevLogTerm:  rf.log[startOfEntries-1].Term,
-		Entries:      rf.log[startOfEntries : endOfEntries+1],
+		PrevLogTerm:  rf.log[rf.getPhysicalArrayIndex(startOfEntries-1)].Term,
+		Entries:      rf.log[rf.getPhysicalArrayIndex(startOfEntries) : rf.getPhysicalArrayIndex(endOfEntries+1)],
 		LeaderCommit: rf.commitIndex,
 	}
 	reply := &AppendEntryReply{}
@@ -494,25 +548,26 @@ func (rf *Raft) sendNewEntriesToPeer(i int) {
 		rf.nextIndex[i] = max(rf.nextIndex[i], endOfEntries+1)
 		rf.matchIndex[i] = max(rf.matchIndex[i], endOfEntries)
 	} else if !reply.Success {
+		baseIndex := rf.log[0].Index
 		if reply.XLen != -1 {
-			rf.nextIndex[i] = max(1, reply.XLen)
+			rf.nextIndex[i] = max(baseIndex+1, reply.XLen)
 		} else {
 			found := false
-            lastIndex := -1
-            for j := len(rf.log) - 1; j >= 1; j-- {
-                if rf.log[j].Term == reply.XTerm {
-                    lastIndex = j
-                    found = true
-                    break
-                } else if rf.log[j].Term < reply.XTerm {
-                    break
-                }
-            }
-            if found {
-                rf.nextIndex[i] = max(1, lastIndex+1)
-            } else {
-                rf.nextIndex[i] = max(1, reply.XIndex)
-            }
+			lastIndex := -1
+			for j := len(rf.log) - 1; j >= 1; j-- {
+				if rf.log[j].Term == reply.XTerm {
+					lastIndex = j + baseIndex
+					found = true
+					break
+				} else if rf.log[j].Term < reply.XTerm {
+					break
+				}
+			}
+			if found {
+				rf.nextIndex[i] = max(baseIndex + 1, lastIndex+1)
+			} else {
+				rf.nextIndex[i] = max(baseIndex + 1, reply.XIndex)
+			}
 		}
 		go rf.sendNewEntriesToPeer(i)
 	}
@@ -531,7 +586,8 @@ func (rf *Raft) leaderUpdateCommitIndex() {
 		sort.Ints(matchIndexCopy)
 		upperN := matchIndexCopy[rf.numberOfPeers/2]
 		for n := upperN; n > rf.commitIndex; n-- {
-			if rf.log[n].Term == rf.currentTerm {
+			arrayIndex := rf.getPhysicalArrayIndex(n)
+			if arrayIndex > 0 && rf.log[arrayIndex].Term == rf.currentTerm {
 				rf.commitIndex = n
 				DPrintf("Peer %v, found new index to commit : %v", rf.me, n)
 				rf.applyCond.Broadcast()
@@ -555,9 +611,10 @@ func (rf *Raft) applyToStateMachine() {
 		msgs := make([]raftapi.ApplyMsg, 0)
 		for rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
+			arrayIndex := rf.getPhysicalArrayIndex(rf.lastApplied);
 			msgs = append(msgs, raftapi.ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log[rf.lastApplied].Command,
+				Command:      rf.log[arrayIndex].Command,
 				CommandIndex: rf.lastApplied,
 			})
 		}
@@ -707,6 +764,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 {
+		go func() {
+			rf.applyCh <- raftapi.ApplyMsg{
+				SnapshotValid: true,
+				Snapshot: snapshot,
+				SnapshotTerm: rf.log[0].Term,
+				SnapshotIndex: rf.log[0].Index,
+			}
+		}()
+	}
 
 	// start ticker goroutine to start elections
 	DPrintf("Starting Raft Ticker for Raft peer : %v", rf.me)
