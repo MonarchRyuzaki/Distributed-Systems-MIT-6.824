@@ -455,6 +455,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.persister.Save(w.Bytes(), args.Data)
 
 	// Tell service to restore from snapshot (outside lock to avoid deadlock)
+	if rf.killed() {
+		return
+	}
 	rf.applyCh <- raftapi.ApplyMsg{
 		SnapshotValid: true,
 		Snapshot:      args.Data,
@@ -711,6 +714,9 @@ func (rf *Raft) applyToStateMachine() {
 		rf.mu.Unlock()
 
 		for _, msg := range msgs {
+			if rf.killed() {
+				return
+			}
 			rf.applyCh <- msg
 		}
 	}
@@ -728,6 +734,10 @@ func (rf *Raft) applyToStateMachine() {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	var once sync.Once
+	once.Do(func() {
+		close(rf.applyCh)
+	})
 }
 
 func (rf *Raft) killed() bool {
@@ -858,6 +868,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	snapshot := persister.ReadSnapshot()
 	if len(snapshot) > 0 {
 		go func() {
+			if rf.killed() {
+				return
+			}
 			rf.applyCh <- raftapi.ApplyMsg{
 				SnapshotValid: true,
 				Snapshot:      snapshot,
