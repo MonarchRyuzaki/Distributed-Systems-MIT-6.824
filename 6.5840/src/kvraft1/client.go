@@ -1,21 +1,29 @@
 package kvraft
 
 import (
-	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
-	"6.5840/tester1"
-)
+	"sync"
+	"time"
 
+	"6.5840/kvsrv1/rpc"
+	kvtest "6.5840/kvtest1"
+	tester "6.5840/tester1"
+)
 
 type Clerk struct {
 	clnt    *tester.Clnt
 	servers []string
 	// You will have to modify this struct.
+	mu           sync.Mutex
+	leaderIndex  int
+	numOfServers int
 }
 
 func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 	ck := &Clerk{clnt: clnt, servers: servers}
 	// You'll have to add code here.
+	ck.mu = sync.Mutex{}
+	ck.leaderIndex = 0
+	ck.numOfServers = len(servers)
 	return ck
 }
 
@@ -32,6 +40,26 @@ func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 
 	// You will have to modify this function.
+	args := rpc.GetArgs{
+		Key: key,
+	}
+	for {
+		reply := rpc.GetReply{}
+		ck.mu.Lock()
+		leaderIndex := ck.leaderIndex
+		ck.mu.Unlock()
+		ok := ck.clnt.Call(ck.servers[leaderIndex], "KVServer.Get", &args, &reply)
+		if !ok || reply.Err == rpc.ErrWrongLeader {
+			ck.mu.Lock()
+			if ck.leaderIndex == leaderIndex {
+				ck.leaderIndex = (ck.leaderIndex + 1) % ck.numOfServers
+			}
+			ck.mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		return reply.Value, reply.Version, reply.Err
+	}
 	return "", 0, ""
 }
 
@@ -54,5 +82,45 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
+	args := rpc.PutArgs{
+		Key:     key,
+		Value:   value,
+		Version: version,
+	}
+	reply := rpc.PutReply{}
+	ck.mu.Lock()
+	leaderIndex := ck.leaderIndex
+	ck.mu.Unlock()
+	ok := ck.clnt.Call(ck.servers[leaderIndex], "KVServer.Put", &args, &reply)
+	if ok && reply.Err != rpc.ErrWrongLeader {
+		return reply.Err
+	}
+	if reply.Err == rpc.ErrWrongLeader {
+		ck.mu.Lock()
+		if ck.leaderIndex == leaderIndex {
+			ck.leaderIndex = (ck.leaderIndex + 1) % ck.numOfServers
+		}
+		ck.mu.Unlock()
+	}
+	for {
+		reply := rpc.PutReply{}
+		ck.mu.Lock()
+		leaderIndex = ck.leaderIndex
+		ck.mu.Unlock()
+		ok := ck.clnt.Call(ck.servers[leaderIndex], "KVServer.Put", &args, &reply)
+		if !ok || reply.Err == rpc.ErrWrongLeader {
+			ck.mu.Lock()
+			if ck.leaderIndex == leaderIndex {
+				ck.leaderIndex = (ck.leaderIndex + 1) % ck.numOfServers
+			}
+			ck.mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if reply.Err == rpc.ErrVersion {
+			return rpc.ErrMaybe
+		}
+		return reply.Err
+	}
 	return ""
 }

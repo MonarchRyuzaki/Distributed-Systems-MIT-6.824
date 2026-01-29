@@ -689,7 +689,7 @@ func (rf *Raft) leaderUpdateCommitIndex() {
 		}
 		rf.mu.Unlock()
 
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

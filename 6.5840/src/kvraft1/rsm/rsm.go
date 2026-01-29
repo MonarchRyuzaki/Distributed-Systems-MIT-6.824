@@ -170,7 +170,7 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 			return rpc.OK, val
 		case <-rsm.dead:
 			return rpc.ErrWrongLeader, nil
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(10 * time.Millisecond):
 			currentTerm, isLeader := rsm.Raft().GetState()
 			if !isLeader || currentTerm != term {
 				rsm.mu.Lock()
