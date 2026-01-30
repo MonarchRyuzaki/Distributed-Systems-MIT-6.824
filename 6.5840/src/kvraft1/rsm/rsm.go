@@ -10,6 +10,7 @@ import (
 	raft "6.5840/raft1"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
+	"6.5840/util"
 )
 
 var useRaftStateMachine bool // to plug in another raft besided raft1
@@ -45,6 +46,7 @@ type RSM struct {
 	// Your definitions here.
 	pendingOps map[int]chan any
 	dead       chan struct{}
+	last       int
 }
 
 // servers[] contains the ports of the set of
@@ -70,12 +72,46 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		sm:           sm,
 		pendingOps:   make(map[int]chan any),
 		dead:         make(chan struct{}),
+		last:         0,
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 {
+		rsm.sm.Restore(snapshot)
+		rsm.last = rsm.Raft().LastApplied()
+	}
+	util.DPrintf("Peer : %v ||Starting Reader", rsm.me)
 	go rsm.reader()
+	util.DPrintf("Peer : %v ||Starting Snapshot Maker", rsm.me)
+	go rsm.MakeSnapshot()
 	return rsm
+}
+
+func (rsm *RSM) MakeSnapshot() {
+	if rsm.maxraftstate == -1 {
+		return
+	}
+	for {
+		select {
+		case <-rsm.dead:
+			return
+		case <-time.After(10 * time.Millisecond):
+		}
+
+		if rsm.maxraftstate <= rsm.Raft().PersistBytes() {
+			rsm.mu.Lock()
+			la := rsm.last
+			if la == 0 {
+				rsm.mu.Unlock()
+				continue
+			}
+			rsm.mu.Unlock()
+
+			rsm.Raft().Snapshot(la, rsm.sm.Snapshot())
+		}
+	}
 }
 
 func (rsm *RSM) Raft() raftapi.Raft {
@@ -84,23 +120,49 @@ func (rsm *RSM) Raft() raftapi.Raft {
 
 func (rsm *RSM) reader() {
 	for msg := range rsm.applyCh {
+		util.DPrintf("Peer : %v ||Received Message : %v in apply Ch", rsm.me, msg)
 		if msg.CommandValid {
+			rsm.mu.Lock()
+			if rsm.last >= msg.CommandIndex {
+				util.DPrintf("Peer : %v ||Command already Executed Skipping", rsm.me)
+				rsm.mu.Unlock()
+				continue
+			}
+			rsm.last = max(rsm.last, msg.CommandIndex)
 			op, ok := msg.Command.(Op)
 			if !ok {
+				rsm.mu.Unlock()
 				continue
 			}
 
+			util.DPrintf("Peer : %v ||Passing to KVServer to Handle the Request", rsm.me)
 			val := rsm.sm.DoOp(op.Req)
 
-			rsm.mu.Lock()
 			ch, exists := rsm.pendingOps[op.ID]
 			if exists {
 				delete(rsm.pendingOps, op.ID)
-				rsm.mu.Unlock()
 				ch <- val
-			} else {
-				rsm.mu.Unlock()
 			}
+			rsm.mu.Unlock()
+		}
+		if msg.SnapshotValid {
+			rsm.mu.Lock()
+			if rsm.last >= msg.SnapshotIndex {
+				rsm.mu.Unlock()
+				continue
+			}
+			for id, ch := range rsm.pendingOps {
+				delete(rsm.pendingOps, id)
+				select {
+				case ch <- rpc.ErrWrongLeader: // Or a specific "Skipped" signal
+				default:
+				}
+			}
+			rsm.last = max(rsm.last, msg.SnapshotIndex)
+			util.DPrintf("Peer : %v ||Passing to KVServer to Handle the Snapshot", rsm.me)
+
+			rsm.sm.Restore(msg.Snapshot)
+			rsm.mu.Unlock()
 		}
 	}
 	close(rsm.dead)

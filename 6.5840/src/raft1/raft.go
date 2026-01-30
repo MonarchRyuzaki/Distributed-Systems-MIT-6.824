@@ -20,6 +20,7 @@ import (
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
+	"6.5840/util"
 )
 
 // A Go object implementing a single Raft peer.
@@ -54,6 +55,13 @@ type Raft struct {
 	// Volatile State on leaders
 	nextIndex  []int
 	matchIndex []int
+}
+
+// LastApplied implements raftapi.Raft.
+func (rf *Raft) LastApplied() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.lastApplied
 }
 
 type Log struct {
@@ -413,23 +421,29 @@ type InstallSnapshotReply struct {
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	util.DPrintf("Peer : %v || In Install RPC A", rf.me)
 	if args.Term < rf.currentTerm {
+		util.DPrintf("Peer : %v || Sender is of old term", rf.me)
 		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
 		return
 	}
+	util.DPrintf("Peer : %v || In Install RPC B", rf.me)
 
 	rf.lastPingTime = time.Now()
 	rf.leaderId = args.LeaderId
 	if args.Term > rf.currentTerm {
 		rf.stepDownToFollower(args.Term)
 	}
+	util.DPrintf("Peer : %v || In Install RPC C", rf.me)
 
 	reply.Term = rf.currentTerm
 
 	if args.LastIncludedIndex <= rf.log[0].Index {
+		rf.mu.Unlock()
 		return
 	}
+	util.DPrintf("Peer : %v || In Install RPC D", rf.me)
 
 	if args.LastIncludedIndex < rf.getLastLogIndex() {
 		arrayIndex := rf.getPhysicalArrayIndex(args.LastIncludedIndex)
@@ -446,6 +460,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	rf.lastApplied = args.LastIncludedIndex
 	rf.commitIndex = args.LastIncludedIndex
+	rf.applyCond.Broadcast()
 
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -453,20 +468,26 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
 	rf.persister.Save(w.Bytes(), args.Data)
+	snapshotData := args.Data
+	snapshotTerm := args.LastIncludedTerm
+	snapshotIndex := args.LastIncludedIndex
+	rf.mu.Unlock()
 
 	// Tell service to restore from snapshot (outside lock to avoid deadlock)
 	if rf.killed() {
 		return
 	}
+	util.DPrintf("Peer : %v || Sending Snapshot in Install rpc", rf.me)
 	rf.applyCh <- raftapi.ApplyMsg{
 		SnapshotValid: true,
-		Snapshot:      args.Data,
-		SnapshotTerm:  args.LastIncludedTerm,
-		SnapshotIndex: args.LastIncludedIndex,
+		Snapshot:      snapshotData,
+		SnapshotTerm:  snapshotTerm,
+		SnapshotIndex: snapshotIndex,
 	}
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	util.DPrintf("Peer : %v || Sending Install RPC to %v", rf.me, server)
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
@@ -614,12 +635,21 @@ func (rf *Raft) sendNewEntriesToPeer(i int) {
 		rf.mu.Unlock()
 		return
 	}
+	srcEntries := rf.log[rf.getPhysicalArrayIndex(startOfEntries):rf.getPhysicalArrayIndex(endOfEntries+1)]
+	entries := make([]Log, len(srcEntries))
+	for i, entry := range srcEntries {
+		entries[i] = Log{
+			Index:   entry.Index,
+			Term:    entry.Term,
+			Command: entry.Command,
+		}
+	}
 	args := &AppendEntryArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.leaderId,
 		PrevLogIndex: startOfEntries - 1,
 		PrevLogTerm:  rf.log[rf.getPhysicalArrayIndex(startOfEntries-1)].Term,
-		Entries:      rf.log[rf.getPhysicalArrayIndex(startOfEntries):rf.getPhysicalArrayIndex(endOfEntries+1)],
+		Entries:      entries,
 		LeaderCommit: rf.commitIndex,
 	}
 	reply := &AppendEntryReply{}
@@ -865,20 +895,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	snapshot := persister.ReadSnapshot()
-	if len(snapshot) > 0 {
-		go func() {
-			if rf.killed() {
-				return
-			}
-			rf.applyCh <- raftapi.ApplyMsg{
-				SnapshotValid: true,
-				Snapshot:      snapshot,
-				SnapshotTerm:  rf.log[0].Term,
-				SnapshotIndex: rf.log[0].Index,
-			}
-		}()
-	}
+	// snapshot := persister.ReadSnapshot()
+	// if len(snapshot) > 0 {
+	// 	go func() {
+	// 		if rf.killed() {
+	// 			return
+	// 		}
+	// 		util.DPrintf("Peer : %v || Sending Initial Snapshot to rsm", rf.me)
+	// 		rf.applyCh <- raftapi.ApplyMsg{
+	// 			SnapshotValid: true,
+	// 			Snapshot:      snapshot,
+	// 			SnapshotTerm:  rf.log[0].Term,
+	// 			SnapshotIndex: rf.log[0].Index,
+	// 		}
+	// 	}()
+	// }
 
 	// start ticker goroutine to start elections
 	DPrintf("Starting Raft Ticker for Raft peer : %v", rf.me)

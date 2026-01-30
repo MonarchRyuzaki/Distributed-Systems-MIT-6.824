@@ -11,6 +11,7 @@ import (
 	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
 	tester "6.5840/tester1"
+	"6.5840/util"
 )
 
 const (
@@ -388,7 +389,9 @@ func TestSnapshotRPC4C(t *testing.T) {
 		verc = ts.PutAtLeastOnce(ck1, "c", "C", rpc.Tversion(0), -1)
 		ts.PutAtLeastOnce(ck1, "d", "D", rpc.Tversion(0), -1)
 		ts.CheckGet(ck1, "a", "A", vera)
+		util.DPrintf("Before b, B, %v", verb)
 		ts.CheckGet(ck1, "b", "B", verb)
+		util.DPrintf("After b, B, %v", verb)
 		ts.CheckGet(ck1, "1", "1", rpc.Tversion(1))
 		ts.CheckGet(ck1, "49", "49", rpc.Tversion(1))
 	}

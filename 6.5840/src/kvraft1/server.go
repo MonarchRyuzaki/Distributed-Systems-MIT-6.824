@@ -11,6 +11,7 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	tester "6.5840/tester1"
+	"6.5840/util"
 )
 
 type KVServer struct {
@@ -73,10 +74,12 @@ func (kv *KVServer) DoOp(req any) any {
 	// Your code here
 	switch args := req.(type) {
 	case rpc.GetArgs:
+		// util.DPrintf("Handling Get %v", args.Key)
 		reply := &rpc.GetReply{}
 		kv.performGet(&args, reply)
 		return reply
 	case rpc.PutArgs:
+		// util.DPrintf("Handling Put %v : {Value : %v , Version : %v}", args.Key, args.Value, args.Version)
 		reply := &rpc.PutReply{}
 		kv.performPut(&args, reply)
 		return reply
@@ -88,6 +91,7 @@ func (kv *KVServer) Snapshot() []byte {
 	// Your code here
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	util.DPrintf("Peer :%v || Snapshotting Application State", kv.me)
 
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -103,6 +107,7 @@ func (kv *KVServer) Restore(data []byte) {
 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	util.DPrintf("Peer : %v || Restoring Application State", kv.me)
 
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
